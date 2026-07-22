@@ -8,9 +8,9 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
-from telegram.error import BadRequest, RetryAfter, TimedOut
+from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
 
 import main
 
@@ -49,6 +49,8 @@ def make_config(
             max_retries=max_retries,
             retry_base_delay_s=0.01,
             media_group_wait_s=media_group_wait_s,
+            polling_health_check_interval_s=60,
+            polling_stale_timeout_s=300,
         ),
         destinations=(
             main.Destination(
@@ -94,6 +96,7 @@ class ConfigTests(unittest.TestCase):
     def test_load_config_applies_defaults_and_deduplicates_topics(self) -> None:
         config = main.load_config(self.write_config(self.valid_payload()))
         self.assertEqual(config.network.connection_pool_size, 32)
+        self.assertEqual(config.network.polling_stale_timeout_s, 300)
         self.assertEqual(config.watchdog.max_consecutive_restarts, 0)
         self.assertEqual(config.destinations[0].topic_ids, (2, 3))
 
@@ -137,6 +140,15 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(main.ConfigError, "端口"):
             main.load_config(self.write_config(payload))
 
+    def test_polling_health_interval_must_be_shorter_than_stale_timeout(self) -> None:
+        payload = self.valid_payload()
+        payload["network"] = {
+            "polling_health_check_interval_s": 300,
+            "polling_stale_timeout_s": 300,
+        }
+        with self.assertRaisesRegex(main.ConfigError, "polling_health_check_interval_s"):
+            main.load_config(self.write_config(payload))
+
     def test_request_settings_cover_api_and_polling(self) -> None:
         config = make_config()
         api_request = object()
@@ -156,6 +168,24 @@ class ConfigTests(unittest.TestCase):
         self.assertIn("media_write_timeout", api_kwargs)
         self.assertNotIn("media_write_timeout", polling_kwargs)
 
+    def test_polling_request_uses_health_monitor_when_requested(self) -> None:
+        config = make_config()
+        health = main.PollingHealth()
+        monitored_request = object()
+        with patch.object(
+            main, "MonitoredHTTPXRequest", return_value=monitored_request
+        ) as constructor:
+            self.assertIs(
+                main.create_request(
+                    config,
+                    for_updates=True,
+                    polling_health=health,
+                ),
+                monitored_request,
+            )
+        self.assertIs(constructor.call_args.args[0], health)
+        self.assertEqual(constructor.call_args.kwargs["connection_pool_size"], 1)
+
     def test_safe_error_redacts_token_and_proxy_credentials(self) -> None:
         config = make_config()
         error = RuntimeError(
@@ -166,6 +196,20 @@ class ConfigTests(unittest.TestCase):
         self.assertNotIn(config.bot.token, rendered)
         self.assertNotIn("password", rendered)
         self.assertNotIn("secret", rendered)
+
+    def test_safe_error_includes_redacted_cause_chain(self) -> None:
+        config = make_config()
+        try:
+            try:
+                raise OSError(f"proxy failed: {config.bot.proxy_url}")
+            except OSError as cause:
+                raise NetworkError("polling failed") from cause
+        except NetworkError as error:
+            rendered = main.safe_error_text(error, config)
+
+        self.assertIn("NetworkError", rendered)
+        self.assertIn("OSError", rendered)
+        self.assertNotIn("password", rendered)
 
     def test_formatter_redacts_exception_traceback(self) -> None:
         config = make_config()
@@ -204,6 +248,119 @@ class ConfigTests(unittest.TestCase):
 
 
 class ForwardingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_application_wires_monitored_polling_and_health_job(self) -> None:
+        asyncio.get_running_loop().slow_callback_duration = 1.0
+        service = main.ForwardBotService(make_config())
+        application = main.build_application(service.config, service)
+        try:
+            polling_request = application.bot._request[0]
+            self.assertIsInstance(polling_request, main.MonitoredHTTPXRequest)
+            self.assertIs(polling_request.polling_health, service.polling_health)
+            self.assertEqual(
+                {job.name for job in application.job_queue.jobs()},
+                {"heartbeat", "polling-health"},
+            )
+        finally:
+            await asyncio.gather(
+                *(request.shutdown() for request in application.bot._request)
+            )
+
+    async def test_monitored_request_records_transport_result(self) -> None:
+        health = main.PollingHealth()
+        request = object.__new__(main.MonitoredHTTPXRequest)
+        request.polling_health = health
+
+        with patch.object(
+            main.HTTPXRequest,
+            "do_request",
+            new=AsyncMock(return_value=(200, b"{}")),
+        ):
+            await request.do_request("https://example.invalid", "POST")
+        self.assertIsNotNone(health.last_response_at)
+        self.assertEqual(health.consecutive_failures, 0)
+
+        health.last_response_at = None
+        with patch.object(
+            main.HTTPXRequest,
+            "do_request",
+            new=AsyncMock(return_value=(409, b"{}")),
+        ):
+            await request.do_request("https://example.invalid", "POST")
+        self.assertIsNotNone(health.last_response_at)
+        self.assertEqual(health.consecutive_failures, 0)
+
+        with patch.object(
+            main.HTTPXRequest,
+            "do_request",
+            new=AsyncMock(side_effect=NetworkError("offline")),
+        ):
+            with self.assertRaises(NetworkError):
+                await request.do_request("https://example.invalid", "POST")
+        self.assertEqual(health.consecutive_failures, 1)
+
+    async def test_stale_polling_with_failed_probe_does_not_restart(self) -> None:
+        service = main.ForwardBotService(make_config())
+        service.polling_health.monitoring_started_at = main.time.monotonic() - 301
+        stop_running = Mock()
+        context = SimpleNamespace(
+            application=SimpleNamespace(stop_running=stop_running)
+        )
+
+        with patch.object(
+            main,
+            "probe_telegram_route",
+            new=AsyncMock(side_effect=NetworkError("proxy offline")),
+        ):
+            with self.assertLogs(main.logger, level="WARNING"):
+                await service.polling_health_task(context)
+
+        self.assertFalse(service.restart_requested)
+        self.assertEqual(service.polling_health_state, "network_unavailable")
+        stop_running.assert_not_called()
+
+    async def test_stale_polling_with_healthy_probe_requests_restart(self) -> None:
+        service = main.ForwardBotService(make_config())
+        service.polling_health.monitoring_started_at = main.time.monotonic() - 301
+        stop_running = Mock()
+        context = SimpleNamespace(
+            application=SimpleNamespace(stop_running=stop_running)
+        )
+
+        with patch.object(
+            main,
+            "probe_telegram_route",
+            new=AsyncMock(return_value=SimpleNamespace(id=1)),
+        ):
+            with self.assertLogs(main.logger, level="CRITICAL"):
+                await service.polling_health_task(context)
+
+        self.assertTrue(service.restart_requested)
+        self.assertEqual(service.polling_health_state, "polling_stalled")
+        stop_running.assert_called_once_with()
+
+    async def test_polling_recovery_during_probe_avoids_restart(self) -> None:
+        service = main.ForwardBotService(make_config())
+        service.polling_health.monitoring_started_at = main.time.monotonic() - 301
+        stop_running = Mock()
+        context = SimpleNamespace(
+            application=SimpleNamespace(stop_running=stop_running)
+        )
+
+        async def recover_during_probe(*args, **kwargs):
+            service.polling_health.mark_response()
+            return SimpleNamespace(id=1)
+
+        with patch.object(
+            main,
+            "probe_telegram_route",
+            new=AsyncMock(side_effect=recover_during_probe),
+        ):
+            await service.polling_health_task(context)
+
+        self.assertFalse(service.restart_requested)
+        self.assertEqual(service.polling_health_state, "healthy")
+        stop_running.assert_not_called()
+
     async def test_heartbeat_write_is_atomic_and_numeric(self) -> None:
         config = make_config()
         heartbeat = config.watchdog.heartbeat_file

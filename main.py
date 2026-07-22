@@ -11,7 +11,7 @@ import re
 import sys
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, BinaryIO, TypeVar
@@ -44,6 +44,7 @@ DEFAULT_CONFIG_FILE = BASE_DIR / "config.json"
 INSTANCE_LOCK_FILE = BASE_DIR / "bot.main.lock"
 LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 SUPPORTED_PROXY_SCHEMES = {"http", "https", "socks5", "socks5h"}
+POLLING_TIMEOUT_S = 10
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
@@ -89,6 +90,8 @@ class NetworkSettings:
     max_retries: int
     retry_base_delay_s: float
     media_group_wait_s: float
+    polling_health_check_interval_s: float
+    polling_stale_timeout_s: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,6 +114,32 @@ class MediaGroupBuffer:
     deadline: float
     changed: asyncio.Event
     task: asyncio.Task[None] | None = None
+
+
+@dataclass(slots=True)
+class PollingHealth:
+    """Track the dedicated getUpdates transport independently from event-loop liveness."""
+
+    monitoring_started_at: float = field(default_factory=time.monotonic)
+    last_response_at: float | None = None
+    consecutive_failures: int = 0
+
+    def reset(self) -> None:
+        self.monitoring_started_at = time.monotonic()
+        self.last_response_at = None
+        self.consecutive_failures = 0
+
+    def mark_response(self) -> None:
+        self.last_response_at = time.monotonic()
+        self.consecutive_failures = 0
+
+    def mark_failure(self) -> None:
+        self.consecutive_failures += 1
+
+    def seconds_since_response(self, now: float | None = None) -> float:
+        current = time.monotonic() if now is None else now
+        baseline = self.last_response_at or self.monitoring_started_at
+        return max(0.0, current - baseline)
 
 
 @dataclass(frozen=True, slots=True)
@@ -352,11 +381,30 @@ def load_config(config_file: Path | str = DEFAULT_CONFIG_FILE) -> AppConfig:
             "'network.max_concurrent_sends' 不能大于 connection_pool_size。"
         )
 
+    read_timeout = _positive_number(
+        network_raw.get("read_timeout", 20.0), "network.read_timeout"
+    )
+    polling_health_check_interval = _positive_number(
+        network_raw.get("polling_health_check_interval_s", 60.0),
+        "network.polling_health_check_interval_s",
+    )
+    polling_stale_timeout = _positive_number(
+        network_raw.get("polling_stale_timeout_s", 300.0),
+        "network.polling_stale_timeout_s",
+    )
+    if polling_health_check_interval >= polling_stale_timeout:
+        raise ConfigError(
+            "'network.polling_health_check_interval_s' 必须小于 "
+            "polling_stale_timeout_s。"
+        )
+    if polling_stale_timeout <= read_timeout + POLLING_TIMEOUT_S:
+        raise ConfigError(
+            "'network.polling_stale_timeout_s' 必须大于一次正常长轮询的最大读取时间。"
+        )
+
     network = NetworkSettings(
         connection_pool_size=connection_pool_size,
-        read_timeout=_positive_number(
-            network_raw.get("read_timeout", 20.0), "network.read_timeout"
-        ),
+        read_timeout=read_timeout,
         connect_timeout=_positive_number(
             network_raw.get("connect_timeout", 10.0), "network.connect_timeout"
         ),
@@ -382,6 +430,8 @@ def load_config(config_file: Path | str = DEFAULT_CONFIG_FILE) -> AppConfig:
             network_raw.get("media_group_wait_s", 2.0),
             "network.media_group_wait_s",
         ),
+        polling_health_check_interval_s=polling_health_check_interval,
+        polling_stale_timeout_s=polling_stale_timeout,
     )
 
     destination_values = root.get("destinations")
@@ -459,15 +509,41 @@ def configure_logging(config: AppConfig) -> None:
     for handler in logging.getLogger().handlers:
         handler.setFormatter(formatter)
 
-    # PTB records can contain the token, complete updates, or private message text.
-    logging.getLogger("telegram").setLevel(logging.CRITICAL + 1)
+    # DEBUG/INFO PTB records may contain complete updates or private message text. Warnings are
+    # still useful for diagnosing polling recovery and pass through the redacting formatter.
+    logging.getLogger("telegram").setLevel(logging.WARNING)
     logging.getLogger("httpx").setLevel(logging.CRITICAL + 1)
     logging.getLogger("httpcore").setLevel(logging.CRITICAL + 1)
     logging.getLogger("apscheduler").setLevel(logging.WARNING)
     logging.getLogger("asyncio").setLevel(logging.WARNING)
 
 
-def create_request(config: AppConfig, *, for_updates: bool) -> HTTPXRequest:
+class MonitoredHTTPXRequest(HTTPXRequest):
+    """HTTPXRequest variant that records transport-level getUpdates progress."""
+
+    def __init__(self, polling_health: PollingHealth, **kwargs: Any):
+        self.polling_health = polling_health
+        super().__init__(**kwargs)
+
+    async def do_request(self, *args: Any, **kwargs: Any) -> tuple[int, bytes]:
+        try:
+            status_code, payload = await super().do_request(*args, **kwargs)
+        except Exception:
+            self.polling_health.mark_failure()
+            raise
+
+        # Any HTTP response proves that the polling transport and retry loop are making progress.
+        # API-level errors such as 409 Conflict are not fixed by restarting this process.
+        self.polling_health.mark_response()
+        return status_code, payload
+
+
+def create_request(
+    config: AppConfig,
+    *,
+    for_updates: bool,
+    polling_health: PollingHealth | None = None,
+) -> HTTPXRequest:
     network = config.network
     params: dict[str, Any] = {
         "connection_pool_size": 1 if for_updates else network.connection_pool_size,
@@ -480,13 +556,40 @@ def create_request(config: AppConfig, *, for_updates: bool) -> HTTPXRequest:
         params["media_write_timeout"] = network.media_write_timeout
     if config.bot.proxy_url:
         params["proxy"] = config.bot.proxy_url
+    if for_updates and polling_health is not None:
+        return MonitoredHTTPXRequest(polling_health, **params)
     return HTTPXRequest(**params)
 
 
 def safe_error_text(error: BaseException, config: AppConfig) -> str:
     """Format an exception without exposing the token or proxy credentials."""
-    text = redact_sensitive_text(str(error), config)
-    return f"{type(error).__name__}: {text}"
+    parts: list[str] = []
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen and len(parts) < 6:
+        seen.add(id(current))
+        message = str(current).strip()
+        part = type(current).__name__
+        if message:
+            part = f"{part}: {message}"
+        parts.append(part)
+        current = current.__cause__ or current.__context__
+    return redact_sensitive_text(" <- ".join(parts), config)
+
+
+async def probe_telegram_route(
+    config: AppConfig,
+    *,
+    for_updates: bool,
+) -> telegram.User:
+    """Call getMe through a fresh request profile without consuming Telegram updates."""
+    bot = telegram.Bot(
+        token=config.bot.token,
+        request=create_request(config, for_updates=for_updates),
+        get_updates_request=create_request(config, for_updates=for_updates),
+    )
+    async with bot:
+        return bot.bot
 
 
 def acquire_instance_lock(path: Path = INSTANCE_LOCK_FILE) -> BinaryIO | None:
@@ -521,6 +624,10 @@ class ForwardBotService:
         self.send_semaphore = asyncio.Semaphore(config.network.max_concurrent_sends)
         self.forward_lock = asyncio.Lock()
         self.media_groups: dict[str, MediaGroupBuffer] = {}
+        self.polling_health = PollingHealth()
+        self.polling_health_state = "starting"
+        self.restart_requested = False
+        self.last_network_error_log_at = 0.0
 
     @staticmethod
     def _expand_targets(config: AppConfig) -> tuple[SendTarget, ...]:
@@ -803,10 +910,65 @@ class ForwardBotService:
     async def heartbeat_task(self, context: ContextTypes.DEFAULT_TYPE) -> None:
         try:
             self.write_heartbeat()
+            logger.debug("事件循环心跳已更新。")
         except OSError:
             logger.exception("写入心跳文件失败。")
 
+    def _mark_polling_healthy(self, age: float) -> None:
+        if self.polling_health_state == "starting":
+            logger.info("Telegram polling 健康检查已建立。")
+        elif self.polling_health_state != "healthy":
+            logger.info("Telegram polling 已恢复，最近完成响应在 %.1f 秒前。", age)
+        self.polling_health_state = "healthy"
+
+    async def polling_health_task(self, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Restart only when polling is stale while a fresh Telegram route still works."""
+        timeout = self.config.network.polling_stale_timeout_s
+        age = self.polling_health.seconds_since_response()
+        if self.polling_health.last_response_at is not None and age <= timeout:
+            self._mark_polling_healthy(age)
+            return
+        if age <= timeout or self.restart_requested:
+            return
+
+        try:
+            await probe_telegram_route(self.config, for_updates=True)
+        except Exception as exc:
+            # The dedicated polling request may recover while the independent probe is running.
+            age = self.polling_health.seconds_since_response()
+            if self.polling_health.last_response_at is not None and age <= timeout:
+                self._mark_polling_healthy(age)
+                return
+            if self.polling_health_state != "network_unavailable":
+                logger.warning(
+                    "Telegram polling 已连续 %.1f 秒未收到 HTTP 响应，独立网络探测也失败；"
+                    "判定为代理或外部网络故障，本次不重启（连续网络异常 %s 次）。原因: %s",
+                    age,
+                    self.polling_health.consecutive_failures,
+                    safe_error_text(exc, self.config),
+                )
+            self.polling_health_state = "network_unavailable"
+            return
+
+        # A newly-created client can reach Telegram. Recheck the original polling route before
+        # requesting a restart, so a concurrent recovery does not cause an unnecessary restart.
+        age = self.polling_health.seconds_since_response()
+        if self.polling_health.last_response_at is not None and age <= timeout:
+            self._mark_polling_healthy(age)
+            return
+
+        self.polling_health_state = "polling_stalled"
+        self.restart_requested = True
+        logger.critical(
+            "Telegram polling 已连续 %.1f 秒未收到 HTTP 响应，但独立网络探测正常；"
+            "判定轮询客户端假死，正在请求看门狗重启（此前连续网络异常 %s 次）。",
+            age,
+            self.polling_health.consecutive_failures,
+        )
+        context.application.stop_running()
+
     async def post_init(self, application: Application) -> None:
+        self.polling_health.reset()
         self.write_heartbeat()
         identity = application.bot.bot
         username = f"@{identity.username}" if identity.username else str(identity.id)
@@ -824,7 +986,13 @@ class ForwardBotService:
     ) -> None:
         error = context.error
         if isinstance(error, NetworkError):
-            logger.error("Telegram 网络错误: %s", safe_error_text(error, self.config))
+            now = time.monotonic()
+            if now - self.last_network_error_log_at >= 60:
+                logger.warning(
+                    "Telegram polling 网络错误，PTB 将继续重试: %s",
+                    safe_error_text(error, self.config),
+                )
+                self.last_network_error_log_at = now
         else:
             detail = safe_error_text(error, self.config) if error else "未知错误"
             logger.error("处理更新时发生未捕获异常: %s", detail)
@@ -835,7 +1003,13 @@ def build_application(config: AppConfig, service: ForwardBotService) -> Applicat
         ApplicationBuilder()
         .token(config.bot.token)
         .request(create_request(config, for_updates=False))
-        .get_updates_request(create_request(config, for_updates=True))
+        .get_updates_request(
+            create_request(
+                config,
+                for_updates=True,
+                polling_health=service.polling_health,
+            )
+        )
         .post_init(service.post_init)
         .build()
     )
@@ -854,23 +1028,35 @@ def build_application(config: AppConfig, service: ForwardBotService) -> Applicat
         service.heartbeat_task,
         interval=config.watchdog.heartbeat_interval_s,
         name="heartbeat",
+        job_kwargs={
+            "coalesce": True,
+            "max_instances": 1,
+            "misfire_grace_time": max(
+                1, math.ceil(config.watchdog.heartbeat_interval_s)
+            ),
+        },
+    )
+    application.job_queue.run_repeating(
+        service.polling_health_task,
+        interval=config.network.polling_health_check_interval_s,
+        name="polling-health",
+        job_kwargs={
+            "coalesce": True,
+            "max_instances": 1,
+            "misfire_grace_time": max(
+                1, math.ceil(config.network.polling_health_check_interval_s)
+            ),
+        },
     )
     return application
 
 
 async def check_telegram_connectivity(config: AppConfig) -> telegram.User:
     """Check both configured HTTP routes with getMe without consuming updates."""
-    identities: list[telegram.User] = []
-    for for_updates in (False, True):
-        primary = create_request(config, for_updates=for_updates)
-        secondary = create_request(config, for_updates=for_updates)
-        bot = telegram.Bot(
-            token=config.bot.token,
-            request=primary,
-            get_updates_request=secondary,
-        )
-        async with bot:
-            identities.append(await bot.get_me())
+    identities = [
+        await probe_telegram_route(config, for_updates=for_updates)
+        for for_updates in (False, True)
+    ]
     if identities[0].id != identities[1].id:
         raise RuntimeError("普通请求与轮询请求返回了不同的 Bot 身份。")
     return identities[0]
@@ -944,10 +1130,14 @@ def main(argv: list[str] | None = None) -> int:
     try:
         application = build_application(config, service)
         application.run_polling(
+            timeout=POLLING_TIMEOUT_S,
             allowed_updates=["message"],
             bootstrap_retries=3,
             close_loop=True,
         )
+        if service.restart_requested:
+            logger.error("机器人因 polling 假死检测主动退出，交由看门狗重启。")
+            return 1
         return 0
     except KeyboardInterrupt:
         logger.info("收到中断信号，正在退出。")
