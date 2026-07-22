@@ -10,16 +10,22 @@
     "heartbeat_file": "bot.heartbeat",
     "heartbeat_interval_s": 60,
     "heartbeat_timeout_s": 300,
+    "startup_grace_s": 300,
     "restart_delay_s": 5,
-    "max_consecutive_restarts": 5
+    "max_consecutive_restarts": 5,
+    "stable_reset_s": 600
   },
   "network": {
-    "connection_pool_size": 2048,
+    "connection_pool_size": 32,
     "read_timeout": 20.0,
     "connect_timeout": 10.0,
     "pool_timeout": 10.0,
     "write_timeout": 20.0,
-    "media_write_timeout": 60.0
+    "media_write_timeout": 60.0,
+    "max_concurrent_sends": 4,
+    "max_retries": 3,
+    "retry_base_delay_s": 1.0,
+    "media_group_wait_s": 2.0
   },
   "destinations": [
     {

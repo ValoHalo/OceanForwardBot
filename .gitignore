@@ -1,6 +1,35 @@
-.venv
-venv
-
-bot.heartbeat
-
+# 本地配置与运行状态（可能包含 Token/代理凭据）
 config.json
+.env
+.env.*
+!.env.example
+*.heartbeat
+.*.heartbeat.tmp
+*.lock
+
+# Python 虚拟环境、字节码与工具缓存
+.venv/
+venv/
+env/
+ENV/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# 构建产物和日志
+build/
+dist/
+*.egg-info/
+*.log
+
+# 编辑器与操作系统文件
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
