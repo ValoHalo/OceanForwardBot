@@ -362,6 +362,31 @@ class ForwardingTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(processed.text, expected)
                 self.assertEqual(processed.rule_name, "fxtwitter")
 
+    def test_process_draft_rewrites_supported_bare_domain_urls(self) -> None:
+        pixiv_rule = main.UrlRewriteRule(
+            name="phixiv",
+            enabled=True,
+            source_hosts=("pixiv.net", "www.pixiv.net"),
+            target_host="www.phixiv.net",
+            path_pattern=re.compile(r"^/(?:[a-z]{2}/)?artworks/[0-9]+$"),
+            strip_query=True,
+            strip_fragment=True,
+        )
+        service = main.ForwardBotService(
+            make_config(url_rewrites=(make_fxtwitter_rule(), pixiv_rule))
+        )
+        cases = {
+            "x.com/owner/status/123?s=20": "https://fxtwitter.com/owner/status/123",
+            "www.pixiv.net/artworks/147533083": (
+                "https://www.phixiv.net/artworks/147533083"
+            ),
+        }
+        for source, expected in cases.items():
+            with self.subTest(source=source):
+                processed = service.process_draft((SimpleNamespace(text=source),))
+                self.assertIsNotNone(processed)
+                self.assertEqual(processed.text, expected)
+
     def test_process_draft_ignores_non_standalone_or_unsupported_content(self) -> None:
         service = main.ForwardBotService(
             make_config(url_rewrites=(make_fxtwitter_rule(),))

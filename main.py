@@ -983,6 +983,10 @@ class ForwardBotService:
         candidate = messages[0].text.strip()
         if not candidate or re.search(r"\s", candidate):
             return None
+        # Telegram recognizes bare domains such as "www.pixiv.net/..." as links,
+        # but urlsplit treats them as a path unless a scheme is supplied.
+        if "://" not in candidate:
+            candidate = f"https://{candidate}"
         try:
             parsed = urlsplit(candidate)
             hostname = parsed.hostname
