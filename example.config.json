@@ -29,6 +29,36 @@
     "polling_health_check_interval_s": 60.0,
     "polling_stale_timeout_s": 300.0
   },
+  "message_processing": {
+    "url_rewrites": [
+      {
+        "name": "fxtwitter",
+        "enabled": true,
+        "source_hosts": [
+          "x.com",
+          "www.x.com",
+          "twitter.com",
+          "www.twitter.com"
+        ],
+        "target_host": "fxtwitter.com",
+        "path_pattern": "^/(?:i/status/[0-9]+|[^/]+/status/[0-9]+)(?:/.*)?$",
+        "strip_query": true,
+        "strip_fragment": true
+      },
+      {
+        "name": "phixiv",
+        "enabled": true,
+        "source_hosts": [
+          "pixiv.net",
+          "www.pixiv.net"
+        ],
+        "target_host": "www.phixiv.net",
+        "path_pattern": "^/(?:[a-z]{2}/)?artworks/[0-9]+(?:/[0-9]+(?:-[0-9]+)?)?$",
+        "strip_query": true,
+        "strip_fragment": true
+      }
+    ]
+  },
   "destinations": [
     {
       "chat_id": -1001234567890,

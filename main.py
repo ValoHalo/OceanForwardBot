@@ -15,12 +15,13 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, BinaryIO, TypeVar
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 # Opt in to PTB's v23 time-delta behavior while remaining compatible with v22.
 os.environ.setdefault("PTB_TIMEDELTA", "true")
 
 import telegram
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import (
     BadRequest,
     Forbidden,
@@ -32,6 +33,8 @@ from telegram.error import (
 from telegram.ext import (
     Application,
     ApplicationBuilder,
+    CallbackQueryHandler,
+    CommandHandler,
     ContextTypes,
     MessageHandler,
     filters,
@@ -45,6 +48,7 @@ INSTANCE_LOCK_FILE = BASE_DIR / "bot.main.lock"
 LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 SUPPORTED_PROXY_SCHEMES = {"http", "https", "socks5", "socks5h"}
 POLLING_TIMEOUT_S = 10
+ALLOWED_UPDATES = ("message", "callback_query")
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
@@ -108,12 +112,40 @@ class SendTarget:
     silent: bool
 
 
+@dataclass(frozen=True, slots=True)
+class UrlRewriteRule:
+    name: str
+    enabled: bool
+    source_hosts: tuple[str, ...]
+    target_host: str
+    path_pattern: re.Pattern[str]
+    strip_query: bool
+    strip_fragment: bool
+
+
+@dataclass(frozen=True, slots=True)
+class MessageProcessingSettings:
+    url_rewrites: tuple[UrlRewriteRule, ...] = ()
+
+
 @dataclass(slots=True)
 class MediaGroupBuffer:
     messages: list[telegram.Message]
     deadline: float
     changed: asyncio.Event
     task: asyncio.Task[None] | None = None
+
+
+@dataclass(slots=True)
+class PendingDraft:
+    original_messages: tuple[telegram.Message, ...]
+    processed_messages: tuple[telegram.Message, ...] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessedDraftContent:
+    text: str
+    rule_name: str
 
 
 @dataclass(slots=True)
@@ -148,6 +180,9 @@ class AppConfig:
     watchdog: WatchdogSettings
     network: NetworkSettings
     destinations: tuple[Destination, ...]
+    message_processing: MessageProcessingSettings = field(
+        default_factory=MessageProcessingSettings
+    )
 
 
 def _mapping(value: Any, name: str) -> dict[str, Any]:
@@ -262,6 +297,89 @@ def _parse_destination(value: Any, index: int) -> Destination:
     return Destination(chat_id=chat_id, topic_ids=tuple(topic_ids), silent_forwarding=silent)
 
 
+def _hostname(value: Any, name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigError(f"'{name}' 必须是非空域名。")
+    hostname = value.strip().lower()
+    if "://" in hostname:
+        raise ConfigError(
+            f"'{name}' 只填写域名，不要包含协议；例如填写 'x.com'，而不是 "
+            "'https://x.com'。"
+        )
+    if not re.fullmatch(
+        r"(?=.{1,253}\Z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*"
+        r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?",
+        hostname,
+    ):
+        raise ConfigError(f"'{name}' 必须是无协议、端口、路径或参数的有效域名。")
+    return hostname
+
+
+def _parse_message_processing(value: Any) -> MessageProcessingSettings:
+    raw = _mapping(value, "message_processing")
+    rewrite_values = raw.get("url_rewrites", [])
+    if not isinstance(rewrite_values, list):
+        raise ConfigError("'message_processing.url_rewrites' 必须是数组。")
+
+    rules: list[UrlRewriteRule] = []
+    seen_names: set[str] = set()
+    for index, rule_value in enumerate(rewrite_values):
+        name_prefix = f"message_processing.url_rewrites[{index}]"
+        rule = _mapping(rule_value, name_prefix)
+
+        rule_name = rule.get("name")
+        if not isinstance(rule_name, str) or not rule_name.strip():
+            raise ConfigError(f"'{name_prefix}.name' 必须是非空字符串。")
+        rule_name = rule_name.strip()
+        normalized_name = rule_name.casefold()
+        if normalized_name in seen_names:
+            raise ConfigError(f"消息处理规则名称重复: '{rule_name}'。")
+        seen_names.add(normalized_name)
+
+        source_values = rule.get("source_hosts")
+        if not isinstance(source_values, list) or not source_values:
+            raise ConfigError(f"'{name_prefix}.source_hosts' 必须是非空域名数组。")
+        source_hosts: list[str] = []
+        seen_hosts: set[str] = set()
+        for host_index, host_value in enumerate(source_values):
+            host = _hostname(
+                host_value, f"{name_prefix}.source_hosts[{host_index}]"
+            )
+            if host not in seen_hosts:
+                seen_hosts.add(host)
+                source_hosts.append(host)
+
+        pattern_value = rule.get("path_pattern")
+        if not isinstance(pattern_value, str) or not pattern_value:
+            raise ConfigError(f"'{name_prefix}.path_pattern' 必须是非空正则表达式。")
+        try:
+            path_pattern = re.compile(pattern_value)
+        except re.error as exc:
+            raise ConfigError(
+                f"'{name_prefix}.path_pattern' 不是有效正则表达式: {exc}"
+            ) from exc
+
+        rules.append(
+            UrlRewriteRule(
+                name=rule_name,
+                enabled=_bool(rule.get("enabled", True), f"{name_prefix}.enabled"),
+                source_hosts=tuple(source_hosts),
+                target_host=_hostname(
+                    rule.get("target_host"), f"{name_prefix}.target_host"
+                ),
+                path_pattern=path_pattern,
+                strip_query=_bool(
+                    rule.get("strip_query", False), f"{name_prefix}.strip_query"
+                ),
+                strip_fragment=_bool(
+                    rule.get("strip_fragment", False),
+                    f"{name_prefix}.strip_fragment",
+                ),
+            )
+        )
+    return MessageProcessingSettings(url_rewrites=tuple(rules))
+
+
 def load_config(config_file: Path | str = DEFAULT_CONFIG_FILE) -> AppConfig:
     """Load and strictly validate the complete application configuration."""
     path = Path(config_file)
@@ -287,6 +405,9 @@ def load_config(config_file: Path | str = DEFAULT_CONFIG_FILE) -> AppConfig:
     bot_raw = _mapping(root.get("bot"), "bot")
     watchdog_raw = _mapping(root.get("watchdog"), "watchdog")
     network_raw = _mapping(root.get("network", {}), "network")
+    message_processing = _parse_message_processing(
+        root.get("message_processing", {})
+    )
 
     token = bot_raw.get("token")
     if (
@@ -476,6 +597,7 @@ def load_config(config_file: Path | str = DEFAULT_CONFIG_FILE) -> AppConfig:
         ),
         network=network,
         destinations=destinations,
+        message_processing=message_processing,
     )
 
 
@@ -624,6 +746,7 @@ class ForwardBotService:
         self.send_semaphore = asyncio.Semaphore(config.network.max_concurrent_sends)
         self.forward_lock = asyncio.Lock()
         self.media_groups: dict[str, MediaGroupBuffer] = {}
+        self.pending_drafts: dict[int, PendingDraft] = {}
         self.polling_health = PollingHealth()
         self.polling_health_state = "starting"
         self.restart_requested = False
@@ -745,7 +868,7 @@ class ForwardBotService:
         self,
         action_factory: Callable[[SendTarget], Callable[[], Awaitable[Any]]],
         description: str,
-    ) -> None:
+    ) -> tuple[int, int]:
         results = await asyncio.gather(
             *(
                 self._send_with_retry(target, action_factory(target))
@@ -757,8 +880,11 @@ class ForwardBotService:
             logger.error("%s：%s/%s 个目标失败。", description, failures, len(results))
         else:
             logger.info("%s：已发送到 %s 个目标。", description, len(results))
+        return len(results) - failures, len(results)
 
-    async def _forward_message_unlocked(self, message: telegram.Message) -> None:
+    async def _forward_message_unlocked(
+        self, message: telegram.Message
+    ) -> tuple[int, int]:
         def action_factory(target: SendTarget) -> Callable[[], Awaitable[Any]]:
             async def action() -> Any:
                 return await message.copy(
@@ -769,17 +895,17 @@ class ForwardBotService:
 
             return action
 
-        await self._fan_out(action_factory, f"消息 {message.message_id}")
+        return await self._fan_out(action_factory, f"消息 {message.message_id}")
 
-    async def forward_message(self, message: telegram.Message) -> None:
+    async def forward_message(self, message: telegram.Message) -> tuple[int, int]:
         async with self.forward_lock:
-            await self._forward_message_unlocked(message)
+            return await self._forward_message_unlocked(message)
 
     async def _forward_media_group_unlocked(
         self,
         bot: telegram.Bot,
         messages: list[telegram.Message],
-    ) -> None:
+    ) -> tuple[int, int]:
         messages.sort(key=lambda message: message.message_id)
         source_chat_id = messages[0].chat_id
         message_ids = [message.message_id for message in messages]
@@ -801,15 +927,192 @@ class ForwardBotService:
 
             return action
 
-        await self._fan_out(action_factory, f"相册（{len(message_ids)} 项）")
+        return await self._fan_out(action_factory, f"相册（{len(message_ids)} 项）")
 
     async def forward_media_group(
         self,
         bot: telegram.Bot,
         messages: list[telegram.Message],
-    ) -> None:
+    ) -> tuple[int, int]:
         async with self.forward_lock:
-            await self._forward_media_group_unlocked(bot, messages)
+            return await self._forward_media_group_unlocked(bot, messages)
+
+    @staticmethod
+    def _draft_keyboard(draft_id: int) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "确认发送", callback_data=f"draft:{draft_id}:confirm"
+                    ),
+                    InlineKeyboardButton(
+                        "取消", callback_data=f"draft:{draft_id}:cancel"
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "不处理直接发送", callback_data=f"draft:{draft_id}:direct"
+                    )
+                ],
+            ]
+        )
+
+    @staticmethod
+    def _draft_status_keyboard(
+        draft_id: int, *, succeeded: int, total: int
+    ) -> InlineKeyboardMarkup:
+        label = "✅已发送" if succeeded == total else "⚠️部分发送"
+        return InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        label, callback_data=f"draft:{draft_id}:done"
+                    )
+                ]
+            ]
+        )
+
+    def process_draft(
+        self,
+        messages: tuple[telegram.Message, ...],
+    ) -> ProcessedDraftContent | None:
+        """Return renderable processed content without performing network I/O."""
+        if len(messages) != 1 or not messages[0].text:
+            return None
+
+        candidate = messages[0].text.strip()
+        if not candidate or re.search(r"\s", candidate):
+            return None
+        try:
+            parsed = urlsplit(candidate)
+            hostname = parsed.hostname
+            port = parsed.port
+        except ValueError:
+            return None
+        if (
+            parsed.scheme.lower() not in {"http", "https"}
+            or not parsed.netloc
+            or hostname is None
+            or parsed.username is not None
+            or parsed.password is not None
+            or port is not None
+        ):
+            return None
+
+        normalized_host = hostname.lower()
+        for rule in self.config.message_processing.url_rewrites:
+            if (
+                not rule.enabled
+                or normalized_host not in rule.source_hosts
+                or rule.path_pattern.fullmatch(parsed.path) is None
+            ):
+                continue
+            rewritten = urlunsplit(
+                (
+                    "https",
+                    rule.target_host,
+                    parsed.path,
+                    "" if rule.strip_query else parsed.query,
+                    "" if rule.strip_fragment else parsed.fragment,
+                )
+            )
+            return ProcessedDraftContent(text=rewritten, rule_name=rule.name)
+        return None
+
+    async def _stage_draft(
+        self,
+        bot: telegram.Bot,
+        messages: list[telegram.Message],
+    ) -> None:
+        messages.sort(key=lambda item: item.message_id)
+        original_messages = tuple(messages)
+        draft_id = original_messages[0].message_id
+        processed = self.process_draft(original_messages)
+
+        if processed:
+            preview_message = await bot.send_message(
+                chat_id=self.config.bot.owner_id,
+                text=processed.text,
+                reply_to_message_id=original_messages[-1].message_id,
+                reply_markup=self._draft_keyboard(draft_id),
+            )
+            self.pending_drafts[draft_id] = PendingDraft(
+                original_messages=original_messages,
+                processed_messages=(preview_message,),
+            )
+            logger.info(
+                "消息 %s 命中处理规则 '%s'。", draft_id, processed.rule_name
+            )
+            return
+
+        prompt = (
+                "未检测到需要处理的指令，消息尚未发送。请选择确认发送、取消，"
+                "或不处理直接发送；后续新增的处理指令也会在这里提示。"
+        )
+        await bot.send_message(
+            chat_id=self.config.bot.owner_id,
+            text=prompt,
+            reply_to_message_id=original_messages[-1].message_id,
+            reply_markup=self._draft_keyboard(draft_id),
+        )
+        self.pending_drafts[draft_id] = PendingDraft(
+            original_messages=original_messages,
+        )
+
+    async def _send_draft_messages(
+        self,
+        bot: telegram.Bot,
+        messages: tuple[telegram.Message, ...],
+    ) -> tuple[int, int]:
+        async with self.forward_lock:
+            if len(messages) == 1:
+                return await self._forward_message_unlocked(messages[0])
+            return await self._forward_media_group_unlocked(bot, list(messages))
+
+    async def handle_draft_action(
+        self,
+        update: telegram.Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        query = update.callback_query
+        if query is None or query.from_user.id != self.config.bot.owner_id:
+            return
+        match = re.fullmatch(
+            r"draft:(\d+):(confirm|cancel|direct|done)", query.data or ""
+        )
+        if match is None:
+            await query.answer()
+            return
+        draft_id = int(match.group(1))
+        action = match.group(2)
+        if action == "done":
+            await query.answer("消息已经处理，不会重复发送。")
+            return
+
+        await query.answer("正在处理…")
+        draft = self.pending_drafts.pop(draft_id, None)
+        if draft is None:
+            await query.edit_message_text("这条待发送消息已处理或已失效。")
+            return
+        if action == "cancel":
+            await query.edit_message_text("已取消，消息未发送。")
+            return
+
+        if action == "confirm" and draft.processed_messages:
+            messages = draft.processed_messages
+        else:
+            messages = draft.original_messages
+        succeeded, total = await self._send_draft_messages(context.bot, messages)
+        query_message = getattr(query, "message", None)
+        original_text = query_message.text if query_message and query_message.text else ""
+        status_text = f"已发送 {succeeded}/{total} 个目标。"
+        rendered_text = f"{original_text}\n\n{status_text}" if original_text else status_text
+        await query.edit_message_text(
+            rendered_text,
+            reply_markup=self._draft_status_keyboard(
+                draft_id, succeeded=succeeded, total=total
+            ),
+        )
 
     async def _flush_all_media_groups_unlocked(self, bot: telegram.Bot) -> None:
         for media_group_id in list(self.media_groups):
@@ -817,7 +1120,7 @@ class ForwardBotService:
             if buffer is None:
                 continue
             buffer.changed.set()
-            await self._forward_media_group_unlocked(bot, buffer.messages)
+            await self._stage_draft(bot, buffer.messages)
 
     async def _flush_media_group(
         self,
@@ -830,7 +1133,7 @@ class ForwardBotService:
                 return
             buffer = self.media_groups.pop(media_group_id)
             buffer.changed.set()
-            await self._forward_media_group_unlocked(bot, buffer.messages)
+            await self._stage_draft(bot, buffer.messages)
 
     async def _wait_for_media_group(
         self,
@@ -869,7 +1172,7 @@ class ForwardBotService:
         if not message.media_group_id:
             async with self.forward_lock:
                 await self._flush_all_media_groups_unlocked(context.bot)
-                await self._forward_message_unlocked(message)
+                await self._stage_draft(context.bot, [message])
             return
 
         media_group_id = message.media_group_id
@@ -900,6 +1203,24 @@ class ForwardBotService:
             asyncio.get_running_loop().time() + self.config.network.media_group_wait_s
         )
         buffer.changed.set()
+
+    async def ping_command(
+        self,
+        update: telegram.Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        message = update.effective_message
+        user = update.effective_user
+        chat = update.effective_chat
+        if (
+            message is None
+            or user is None
+            or chat is None
+            or user.id != self.config.bot.owner_id
+            or chat.type != telegram.constants.ChatType.PRIVATE
+        ):
+            return
+        await message.reply_text("Bot 在线。")
 
     def write_heartbeat(self) -> None:
         heartbeat = self.config.watchdog.heartbeat_file
@@ -1014,12 +1335,18 @@ def build_application(config: AppConfig, service: ForwardBotService) -> Applicat
         .build()
     )
 
-    message_filter = (
+    owner_private_filter = (
         filters.ChatType.PRIVATE
         & filters.User(user_id=config.bot.owner_id)
-        & ~filters.COMMAND
     )
+    application.add_handler(
+        CommandHandler("ping", service.ping_command, filters=owner_private_filter)
+    )
+    message_filter = owner_private_filter & ~filters.COMMAND
     application.add_handler(MessageHandler(message_filter, service.handle_message))
+    application.add_handler(
+        CallbackQueryHandler(service.handle_draft_action, pattern=r"^draft:\d+:")
+    )
     application.add_error_handler(service.error_handler)
 
     if application.job_queue is None:
@@ -1131,7 +1458,7 @@ def main(argv: list[str] | None = None) -> int:
         application = build_application(config, service)
         application.run_polling(
             timeout=POLLING_TIMEOUT_S,
-            allowed_updates=["message"],
+            allowed_updates=ALLOWED_UPDATES,
             bootstrap_retries=3,
             close_loop=True,
         )

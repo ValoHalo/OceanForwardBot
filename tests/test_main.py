@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import sys
 import tempfile
 import unittest
@@ -20,6 +21,7 @@ def make_config(
     topic_ids: tuple[int, ...] = (),
     max_retries: int = 2,
     media_group_wait_s: float = 0.01,
+    url_rewrites: tuple[main.UrlRewriteRule, ...] = (),
 ) -> main.AppConfig:
     return main.AppConfig(
         bot=main.BotSettings(
@@ -59,6 +61,23 @@ def make_config(
                 silent_forwarding=None,
             ),
         ),
+        message_processing=main.MessageProcessingSettings(
+            url_rewrites=url_rewrites
+        ),
+    )
+
+
+def make_fxtwitter_rule() -> main.UrlRewriteRule:
+    return main.UrlRewriteRule(
+        name="fxtwitter",
+        enabled=True,
+        source_hosts=("x.com", "www.x.com", "twitter.com", "www.twitter.com"),
+        target_host="fxtwitter.com",
+        path_pattern=re.compile(
+            r"^/(?:i/status/[0-9]+|[^/]+/status/[0-9]+)(?:/.*)?$"
+        ),
+        strip_query=True,
+        strip_fragment=True,
     )
 
 
@@ -99,6 +118,75 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.network.polling_stale_timeout_s, 300)
         self.assertEqual(config.watchdog.max_consecutive_restarts, 0)
         self.assertEqual(config.destinations[0].topic_ids, (2, 3))
+        self.assertEqual(config.message_processing.url_rewrites, ())
+
+    def test_load_config_parses_url_rewrite_rule(self) -> None:
+        payload = self.valid_payload()
+        payload["message_processing"] = {
+            "url_rewrites": [
+                {
+                    "name": "fxtwitter",
+                    "source_hosts": ["X.COM", "x.com", "twitter.com"],
+                    "target_host": "fxtwitter.com",
+                    "path_pattern": r"^/.+/status/[0-9]+$",
+                    "strip_query": True,
+                    "strip_fragment": True,
+                }
+            ]
+        }
+
+        config = main.load_config(self.write_config(payload))
+
+        rule = config.message_processing.url_rewrites[0]
+        self.assertEqual(rule.source_hosts, ("x.com", "twitter.com"))
+        self.assertEqual(rule.target_host, "fxtwitter.com")
+        self.assertTrue(rule.path_pattern.fullmatch("/owner/status/123"))
+
+    def test_url_rewrite_host_rejects_protocol(self) -> None:
+        payload = self.valid_payload()
+        payload["message_processing"] = {
+            "url_rewrites": [
+                {
+                    "name": "bad",
+                    "source_hosts": ["https://x.com"],
+                    "target_host": "fxtwitter.com",
+                    "path_pattern": ".*",
+                }
+            ]
+        }
+        with self.assertRaisesRegex(main.ConfigError, "不要包含协议"):
+            main.load_config(self.write_config(payload))
+
+    def test_url_rewrite_rejects_duplicate_name(self) -> None:
+        payload = self.valid_payload()
+        rule = {
+            "name": "same",
+            "source_hosts": ["x.com"],
+            "target_host": "fxtwitter.com",
+            "path_pattern": ".*",
+        }
+        payload["message_processing"] = {
+            "url_rewrites": [rule, {**rule, "name": "SAME"}]
+        }
+        with self.assertRaisesRegex(main.ConfigError, "名称重复"):
+            main.load_config(self.write_config(payload))
+
+    def test_url_rewrite_rejects_invalid_regex_and_boolean(self) -> None:
+        payload = self.valid_payload()
+        base_rule = {
+            "name": "bad",
+            "source_hosts": ["x.com"],
+            "target_host": "fxtwitter.com",
+            "path_pattern": "[",
+        }
+        payload["message_processing"] = {"url_rewrites": [base_rule]}
+        with self.assertRaisesRegex(main.ConfigError, "不是有效正则"):
+            main.load_config(self.write_config(payload))
+
+        base_rule["path_pattern"] = ".*"
+        base_rule["strip_query"] = "yes"
+        with self.assertRaisesRegex(main.ConfigError, "strip_query"):
+            main.load_config(self.write_config(payload))
 
     def test_owner_id_rejects_boolean(self) -> None:
         payload = self.valid_payload()
@@ -248,6 +336,152 @@ class ConfigTests(unittest.TestCase):
 
 
 class ForwardingTests(unittest.IsolatedAsyncioTestCase):
+    def test_process_draft_rewrites_supported_x_status_urls(self) -> None:
+        service = main.ForwardBotService(
+            make_config(url_rewrites=(make_fxtwitter_rule(),))
+        )
+        cases = {
+            "https://x.com/owner/status/123?s=20#media": (
+                "https://fxtwitter.com/owner/status/123"
+            ),
+            "http://twitter.com/i/status/456/video/1?ref_src=test": (
+                "https://fxtwitter.com/i/status/456/video/1"
+            ),
+            "  https://WWW.X.COM/user/status/789/photo/1  ": (
+                "https://fxtwitter.com/user/status/789/photo/1"
+            ),
+            "https://www.twitter.com/user/status/42/": (
+                "https://fxtwitter.com/user/status/42/"
+            ),
+        }
+        for source, expected in cases.items():
+            with self.subTest(source=source):
+                message = SimpleNamespace(text=source)
+                processed = service.process_draft((message,))
+                self.assertIsNotNone(processed)
+                self.assertEqual(processed.text, expected)
+                self.assertEqual(processed.rule_name, "fxtwitter")
+
+    def test_process_draft_ignores_non_standalone_or_unsupported_content(self) -> None:
+        service = main.ForwardBotService(
+            make_config(url_rewrites=(make_fxtwitter_rule(),))
+        )
+        rejected = (
+            "请看 https://x.com/owner/status/123",
+            "https://x.com/a/status/1 https://x.com/b/status/2",
+            "https://x.com/owner",
+            "https://x.com/search?q=test",
+            "https://example.com/owner/status/123",
+            "ftp://x.com/owner/status/123",
+        )
+        for source in rejected:
+            with self.subTest(source=source):
+                self.assertIsNone(
+                    service.process_draft((SimpleNamespace(text=source),))
+                )
+
+        caption_only = SimpleNamespace(text=None, caption="https://x.com/a/status/1")
+        self.assertIsNone(service.process_draft((caption_only,)))
+        self.assertIsNone(
+            service.process_draft(
+                (
+                    SimpleNamespace(text="https://x.com/a/status/1"),
+                    SimpleNamespace(text="https://x.com/b/status/2"),
+                )
+            )
+        )
+
+    def test_process_draft_uses_first_enabled_matching_rule(self) -> None:
+        disabled = main.UrlRewriteRule(
+            name="disabled",
+            enabled=False,
+            source_hosts=("x.com",),
+            target_host="disabled.example",
+            path_pattern=re.compile(r".*"),
+            strip_query=False,
+            strip_fragment=False,
+        )
+        second = make_fxtwitter_rule()
+        service = main.ForwardBotService(
+            make_config(url_rewrites=(disabled, second))
+        )
+
+        processed = service.process_draft(
+            (SimpleNamespace(text="https://x.com/a/status/1?x=1"),)
+        )
+
+        self.assertEqual(processed.rule_name, "fxtwitter")
+        self.assertEqual(processed.text, "https://fxtwitter.com/a/status/1")
+
+    async def test_stage_draft_sends_processed_preview_with_buttons(self) -> None:
+        service = main.ForwardBotService(
+            make_config(url_rewrites=(make_fxtwitter_rule(),))
+        )
+        preview = SimpleNamespace(message_id=99, copy=AsyncMock())
+        bot = SimpleNamespace(send_message=AsyncMock(return_value=preview))
+        original = SimpleNamespace(
+            message_id=7,
+            text="https://x.com/a/status/1?s=20",
+            copy=AsyncMock(),
+        )
+
+        await service._stage_draft(bot, [original])
+
+        call = bot.send_message.await_args.kwargs
+        self.assertEqual(call["text"], "https://fxtwitter.com/a/status/1")
+        self.assertEqual(call["reply_to_message_id"], 7)
+        button_labels = [
+            button.text
+            for row in call["reply_markup"].inline_keyboard
+            for button in row
+        ]
+        self.assertEqual(
+            button_labels, ["确认发送", "取消", "不处理直接发送"]
+        )
+        self.assertEqual(service.pending_drafts[7].processed_messages, (preview,))
+
+    async def test_stage_draft_without_match_replies_with_instructions(self) -> None:
+        service = main.ForwardBotService(
+            make_config(url_rewrites=(make_fxtwitter_rule(),))
+        )
+        bot = SimpleNamespace(send_message=AsyncMock())
+        original = SimpleNamespace(
+            message_id=8,
+            text="普通消息",
+            copy=AsyncMock(),
+        )
+
+        await service._stage_draft(bot, [original])
+
+        self.assertIn("未检测到需要处理的指令", bot.send_message.await_args.kwargs["text"])
+        self.assertIsNone(service.pending_drafts[8].processed_messages)
+
+    async def test_ping_command_replies_for_owner_private_chat(self) -> None:
+        service = main.ForwardBotService(make_config())
+        message = SimpleNamespace(reply_text=AsyncMock())
+        update = SimpleNamespace(
+            effective_message=message,
+            effective_user=SimpleNamespace(id=service.config.bot.owner_id),
+            effective_chat=SimpleNamespace(type=main.telegram.constants.ChatType.PRIVATE),
+        )
+
+        await service.ping_command(update, SimpleNamespace())
+
+        message.reply_text.assert_awaited_once_with("Bot 在线。")
+
+    async def test_ping_command_ignores_non_owner(self) -> None:
+        service = main.ForwardBotService(make_config())
+        message = SimpleNamespace(reply_text=AsyncMock())
+        update = SimpleNamespace(
+            effective_message=message,
+            effective_user=SimpleNamespace(id=999),
+            effective_chat=SimpleNamespace(type=main.telegram.constants.ChatType.PRIVATE),
+        )
+
+        await service.ping_command(update, SimpleNamespace())
+
+        message.reply_text.assert_not_awaited()
+
     async def test_application_wires_monitored_polling_and_health_job(self) -> None:
         asyncio.get_running_loop().slow_callback_duration = 1.0
         service = main.ForwardBotService(make_config())
@@ -259,6 +493,14 @@ class ForwardingTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 {job.name for job in application.job_queue.jobs()},
                 {"heartbeat", "polling-health"},
+            )
+            self.assertEqual(main.ALLOWED_UPDATES, ("message", "callback_query"))
+            self.assertTrue(
+                any(
+                    isinstance(handler, main.CallbackQueryHandler)
+                    for handlers in application.handlers.values()
+                    for handler in handlers
+                )
             )
         finally:
             await asyncio.gather(
@@ -416,7 +658,10 @@ class ForwardingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_media_group_debounce_resets_and_deduplicates(self) -> None:
         service = main.ForwardBotService(make_config())
-        bot = SimpleNamespace(copy_messages=AsyncMock(return_value=(object(), object())))
+        bot = SimpleNamespace(
+            copy_messages=AsyncMock(return_value=(object(), object())),
+            send_message=AsyncMock(),
+        )
 
         class FakeApplication:
             @staticmethod
@@ -445,22 +690,24 @@ class ForwardingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(task)
         await task
 
-        bot.copy_messages.assert_awaited_once()
-        self.assertEqual(bot.copy_messages.await_args.kwargs["message_ids"], [1, 2])
+        bot.copy_messages.assert_not_awaited()
+        bot.send_message.assert_awaited_once()
+        draft = service.pending_drafts[1]
+        self.assertEqual(
+            [message.message_id for message in draft.original_messages], [1, 2]
+        )
 
-    async def test_pending_album_is_sent_before_following_message(self) -> None:
+    async def test_pending_album_is_staged_before_following_message(self) -> None:
         service = main.ForwardBotService(make_config(media_group_wait_s=60))
-        send_order: list[str] = []
+        prompt_order: list[int] = []
 
-        async def copy_album(**kwargs):
-            send_order.append("album")
-            return (object(),)
+        async def send_prompt(**kwargs):
+            prompt_order.append(kwargs["reply_to_message_id"])
 
-        async def copy_message(**kwargs):
-            send_order.append("message")
-            return object()
-
-        bot = SimpleNamespace(copy_messages=AsyncMock(side_effect=copy_album))
+        bot = SimpleNamespace(
+            copy_messages=AsyncMock(return_value=(object(),)),
+            send_message=AsyncMock(side_effect=send_prompt),
+        )
 
         class FakeApplication:
             @staticmethod
@@ -484,7 +731,7 @@ class ForwardingTests(unittest.IsolatedAsyncioTestCase):
             text="after album",
             caption=None,
             media_group_id=None,
-            copy=AsyncMock(side_effect=copy_message),
+            copy=AsyncMock(),
         )
 
         await service.handle_message(SimpleNamespace(message=album_message), context)
@@ -493,7 +740,102 @@ class ForwardingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(album_task)
         await album_task
 
-        self.assertEqual(send_order, ["album", "message"])
+        self.assertEqual(prompt_order, [1, 2])
+        bot.copy_messages.assert_not_awaited()
+        normal_message.copy.assert_not_awaited()
+        self.assertEqual(set(service.pending_drafts), {1, 2})
+
+    async def test_confirm_button_sends_and_reports_target_count(self) -> None:
+        service = main.ForwardBotService(make_config(topic_ids=(8, 9)))
+        message = SimpleNamespace(message_id=7, copy=AsyncMock())
+        service.pending_drafts[7] = main.PendingDraft(original_messages=(message,))
+        query = SimpleNamespace(
+            data="draft:7:confirm",
+            from_user=SimpleNamespace(id=service.config.bot.owner_id),
+            answer=AsyncMock(),
+            edit_message_text=AsyncMock(),
+            message=SimpleNamespace(text="预览消息"),
+        )
+        context = SimpleNamespace(bot=SimpleNamespace())
+
+        await service.handle_draft_action(
+            SimpleNamespace(callback_query=query), context
+        )
+
+        self.assertEqual(message.copy.await_count, 2)
+        query.edit_message_text.assert_awaited_once()
+        edit_call = query.edit_message_text.await_args
+        self.assertEqual(edit_call.args[0], "预览消息\n\n已发送 2/2 个目标。")
+        status_buttons = edit_call.kwargs["reply_markup"].inline_keyboard
+        self.assertEqual(len(status_buttons), 1)
+        self.assertEqual(len(status_buttons[0]), 1)
+        self.assertEqual(status_buttons[0][0].text, "✅已发送")
+        self.assertEqual(status_buttons[0][0].callback_data, "draft:7:done")
+        self.assertNotIn(7, service.pending_drafts)
+
+    async def test_sent_status_button_does_not_send_again(self) -> None:
+        service = main.ForwardBotService(make_config())
+        query = SimpleNamespace(
+            data="draft:7:done",
+            from_user=SimpleNamespace(id=service.config.bot.owner_id),
+            answer=AsyncMock(),
+            edit_message_text=AsyncMock(),
+        )
+
+        await service.handle_draft_action(
+            SimpleNamespace(callback_query=query),
+            SimpleNamespace(bot=SimpleNamespace()),
+        )
+
+        query.answer.assert_awaited_once_with("消息已经处理，不会重复发送。")
+        query.edit_message_text.assert_not_awaited()
+
+    def test_partial_send_uses_warning_status_button(self) -> None:
+        keyboard = main.ForwardBotService._draft_status_keyboard(
+            7, succeeded=1, total=2
+        )
+        self.assertEqual(keyboard.inline_keyboard[0][0].text, "⚠️部分发送")
+
+    async def test_direct_button_bypasses_processed_preview(self) -> None:
+        service = main.ForwardBotService(make_config())
+        original = SimpleNamespace(message_id=7, copy=AsyncMock())
+        processed = SimpleNamespace(message_id=8, copy=AsyncMock())
+        service.pending_drafts[7] = main.PendingDraft(
+            original_messages=(original,), processed_messages=(processed,)
+        )
+        query = SimpleNamespace(
+            data="draft:7:direct",
+            from_user=SimpleNamespace(id=service.config.bot.owner_id),
+            answer=AsyncMock(),
+            edit_message_text=AsyncMock(),
+        )
+
+        await service.handle_draft_action(
+            SimpleNamespace(callback_query=query),
+            SimpleNamespace(bot=SimpleNamespace()),
+        )
+
+        original.copy.assert_awaited_once()
+        processed.copy.assert_not_awaited()
+
+    async def test_cancel_button_never_sends(self) -> None:
+        service = main.ForwardBotService(make_config())
+        message = SimpleNamespace(message_id=7, copy=AsyncMock())
+        service.pending_drafts[7] = main.PendingDraft(original_messages=(message,))
+        query = SimpleNamespace(
+            data="draft:7:cancel",
+            from_user=SimpleNamespace(id=service.config.bot.owner_id),
+            answer=AsyncMock(),
+            edit_message_text=AsyncMock(),
+        )
+
+        await service.handle_draft_action(
+            SimpleNamespace(callback_query=query),
+            SimpleNamespace(bot=SimpleNamespace()),
+        )
+
+        message.copy.assert_not_awaited()
+        query.edit_message_text.assert_awaited_once_with("已取消，消息未发送。")
 
     async def test_partial_batch_copy_is_reported_without_retry(self) -> None:
         service = main.ForwardBotService(make_config(max_retries=3))
