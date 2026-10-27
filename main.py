@@ -73,12 +73,8 @@ class BotSettings:
 
 @dataclass(frozen=True, slots=True)
 class WatchdogSettings:
-    heartbeat_file: Path
-    heartbeat_interval_s: float
-    heartbeat_timeout_s: float
     restart_delay_s: float
     max_consecutive_restarts: int
-    startup_grace_s: float
     stable_reset_s: float
 
 
@@ -94,8 +90,6 @@ class NetworkSettings:
     max_retries: int
     retry_base_delay_s: float
     media_group_wait_s: float
-    polling_health_check_interval_s: float
-    polling_stale_timeout_s: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,32 +140,6 @@ class PendingDraft:
 class ProcessedDraftContent:
     text: str
     rule_name: str
-
-
-@dataclass(slots=True)
-class PollingHealth:
-    """Track the dedicated getUpdates transport independently from event-loop liveness."""
-
-    monitoring_started_at: float = field(default_factory=time.monotonic)
-    last_response_at: float | None = None
-    consecutive_failures: int = 0
-
-    def reset(self) -> None:
-        self.monitoring_started_at = time.monotonic()
-        self.last_response_at = None
-        self.consecutive_failures = 0
-
-    def mark_response(self) -> None:
-        self.last_response_at = time.monotonic()
-        self.consecutive_failures = 0
-
-    def mark_failure(self) -> None:
-        self.consecutive_failures += 1
-
-    def seconds_since_response(self, now: float | None = None) -> float:
-        current = time.monotonic() if now is None else now
-        baseline = self.last_response_at or self.monitoring_started_at
-        return max(0.0, current - baseline)
 
 
 @dataclass(frozen=True, slots=True)
@@ -230,39 +198,6 @@ def _positive_number(value: Any, name: str) -> float:
     if result <= 0:
         raise ConfigError(f"'{name}' 必须大于 0。")
     return result
-
-
-def _heartbeat_path(value: Any) -> Path:
-    if not isinstance(value, str) or not value.strip():
-        raise ConfigError("'watchdog.heartbeat_file' 必须是非空路径。")
-
-    raw_path = Path(value.strip())
-    resolved = (raw_path if raw_path.is_absolute() else BASE_DIR / raw_path).resolve()
-    try:
-        resolved.relative_to(BASE_DIR)
-    except ValueError as exc:
-        raise ConfigError("'watchdog.heartbeat_file' 必须位于项目目录内。") from exc
-    if resolved == BASE_DIR or not resolved.parent.is_dir():
-        raise ConfigError("'watchdog.heartbeat_file' 的父目录必须已经存在。")
-    if resolved.suffix.lower() != ".heartbeat":
-        raise ConfigError("'watchdog.heartbeat_file' 必须使用 .heartbeat 后缀。")
-    protected_paths = {
-        DEFAULT_CONFIG_FILE.resolve(),
-        (BASE_DIR / "main.py").resolve(),
-        (BASE_DIR / "watchdog.py").resolve(),
-    }
-    if resolved in protected_paths:
-        raise ConfigError("'watchdog.heartbeat_file' 不能指向程序或配置文件。")
-    if resolved.exists() and not resolved.is_file():
-        raise ConfigError("'watchdog.heartbeat_file' 必须是普通文件路径。")
-    if resolved.exists():
-        try:
-            heartbeat_value = float(resolved.read_text(encoding="ascii").strip())
-        except (OSError, UnicodeError, ValueError) as exc:
-            raise ConfigError("现有 heartbeat_file 不是本程序生成的有效心跳。") from exc
-        if not math.isfinite(heartbeat_value) or heartbeat_value <= 0:
-            raise ConfigError("现有 heartbeat_file 不是本程序生成的有效心跳。")
-    return resolved
 
 
 def _parse_destination(value: Any, index: int) -> Destination:
@@ -403,7 +338,7 @@ def load_config(config_file: Path | str = DEFAULT_CONFIG_FILE) -> AppConfig:
 
     root = _mapping(raw, "config")
     bot_raw = _mapping(root.get("bot"), "bot")
-    watchdog_raw = _mapping(root.get("watchdog"), "watchdog")
+    watchdog_raw = _mapping(root.get("watchdog", {}), "watchdog")
     network_raw = _mapping(root.get("network", {}), "network")
     message_processing = _parse_message_processing(
         root.get("message_processing", {})
@@ -452,40 +387,17 @@ def load_config(config_file: Path | str = DEFAULT_CONFIG_FILE) -> AppConfig:
                 "http、https、socks5 或 socks5h URL。"
             )
 
-    heartbeat_file = _heartbeat_path(watchdog_raw.get("heartbeat_file"))
-    heartbeat_interval = _positive_number(
-        watchdog_raw.get("heartbeat_interval_s"), "watchdog.heartbeat_interval_s"
-    )
-    heartbeat_timeout = _positive_number(
-        watchdog_raw.get("heartbeat_timeout_s"), "watchdog.heartbeat_timeout_s"
-    )
-    if heartbeat_timeout <= heartbeat_interval:
-        raise ConfigError(
-            "'watchdog.heartbeat_timeout_s' 必须大于 heartbeat_interval_s。"
-        )
     restart_delay = _number(
-        watchdog_raw.get("restart_delay_s"), "watchdog.restart_delay_s"
+        watchdog_raw.get("restart_delay_s", 5), "watchdog.restart_delay_s"
     )
     max_restarts = _int(
-        watchdog_raw.get("max_consecutive_restarts"),
+        watchdog_raw.get("max_consecutive_restarts", 5),
         "watchdog.max_consecutive_restarts",
         minimum=0,
     )
-    startup_grace = _positive_number(
-        watchdog_raw.get("startup_grace_s", max(heartbeat_timeout, 60)),
-        "watchdog.startup_grace_s",
-    )
-    if startup_grace < heartbeat_interval:
-        raise ConfigError(
-            "'watchdog.startup_grace_s' 不能小于 heartbeat_interval_s。"
-        )
     stable_reset = _positive_number(
         watchdog_raw.get("stable_reset_s", 600), "watchdog.stable_reset_s"
     )
-    if stable_reset <= heartbeat_timeout:
-        raise ConfigError(
-            "'watchdog.stable_reset_s' 必须大于 heartbeat_timeout_s。"
-        )
 
     connection_pool_size = _int(
         network_raw.get("connection_pool_size", 32),
@@ -505,23 +417,6 @@ def load_config(config_file: Path | str = DEFAULT_CONFIG_FILE) -> AppConfig:
     read_timeout = _positive_number(
         network_raw.get("read_timeout", 20.0), "network.read_timeout"
     )
-    polling_health_check_interval = _positive_number(
-        network_raw.get("polling_health_check_interval_s", 60.0),
-        "network.polling_health_check_interval_s",
-    )
-    polling_stale_timeout = _positive_number(
-        network_raw.get("polling_stale_timeout_s", 300.0),
-        "network.polling_stale_timeout_s",
-    )
-    if polling_health_check_interval >= polling_stale_timeout:
-        raise ConfigError(
-            "'network.polling_health_check_interval_s' 必须小于 "
-            "polling_stale_timeout_s。"
-        )
-    if polling_stale_timeout <= read_timeout + POLLING_TIMEOUT_S:
-        raise ConfigError(
-            "'network.polling_stale_timeout_s' 必须大于一次正常长轮询的最大读取时间。"
-        )
 
     network = NetworkSettings(
         connection_pool_size=connection_pool_size,
@@ -551,8 +446,6 @@ def load_config(config_file: Path | str = DEFAULT_CONFIG_FILE) -> AppConfig:
             network_raw.get("media_group_wait_s", 2.0),
             "network.media_group_wait_s",
         ),
-        polling_health_check_interval_s=polling_health_check_interval,
-        polling_stale_timeout_s=polling_stale_timeout,
     )
 
     destination_values = root.get("destinations")
@@ -587,12 +480,8 @@ def load_config(config_file: Path | str = DEFAULT_CONFIG_FILE) -> AppConfig:
             log_level=log_level,
         ),
         watchdog=WatchdogSettings(
-            heartbeat_file=heartbeat_file,
-            heartbeat_interval_s=heartbeat_interval,
-            heartbeat_timeout_s=heartbeat_timeout,
             restart_delay_s=restart_delay,
             max_consecutive_restarts=max_restarts,
-            startup_grace_s=startup_grace,
             stable_reset_s=stable_reset,
         ),
         network=network,
@@ -636,35 +525,13 @@ def configure_logging(config: AppConfig) -> None:
     logging.getLogger("telegram").setLevel(logging.WARNING)
     logging.getLogger("httpx").setLevel(logging.CRITICAL + 1)
     logging.getLogger("httpcore").setLevel(logging.CRITICAL + 1)
-    logging.getLogger("apscheduler").setLevel(logging.WARNING)
     logging.getLogger("asyncio").setLevel(logging.WARNING)
-
-
-class MonitoredHTTPXRequest(HTTPXRequest):
-    """HTTPXRequest variant that records transport-level getUpdates progress."""
-
-    def __init__(self, polling_health: PollingHealth, **kwargs: Any):
-        self.polling_health = polling_health
-        super().__init__(**kwargs)
-
-    async def do_request(self, *args: Any, **kwargs: Any) -> tuple[int, bytes]:
-        try:
-            status_code, payload = await super().do_request(*args, **kwargs)
-        except Exception:
-            self.polling_health.mark_failure()
-            raise
-
-        # Any HTTP response proves that the polling transport and retry loop are making progress.
-        # API-level errors such as 409 Conflict are not fixed by restarting this process.
-        self.polling_health.mark_response()
-        return status_code, payload
 
 
 def create_request(
     config: AppConfig,
     *,
     for_updates: bool,
-    polling_health: PollingHealth | None = None,
 ) -> HTTPXRequest:
     network = config.network
     params: dict[str, Any] = {
@@ -678,8 +545,6 @@ def create_request(
         params["media_write_timeout"] = network.media_write_timeout
     if config.bot.proxy_url:
         params["proxy"] = config.bot.proxy_url
-    if for_updates and polling_health is not None:
-        return MonitoredHTTPXRequest(polling_health, **params)
     return HTTPXRequest(**params)
 
 
@@ -747,10 +612,7 @@ class ForwardBotService:
         self.forward_lock = asyncio.Lock()
         self.media_groups: dict[str, MediaGroupBuffer] = {}
         self.pending_drafts: dict[int, PendingDraft] = {}
-        self.polling_health = PollingHealth()
-        self.polling_health_state = "starting"
-        self.restart_requested = False
-        self.last_network_error_log_at = 0.0
+        self.last_network_error_log_at: float | None = None
 
     @staticmethod
     def _expand_targets(config: AppConfig) -> tuple[SendTarget, ...]:
@@ -938,30 +800,28 @@ class ForwardBotService:
             return await self._forward_media_group_unlocked(bot, messages)
 
     @staticmethod
-    def _draft_keyboard(draft_id: int) -> InlineKeyboardMarkup:
-        return InlineKeyboardMarkup(
+    def _draft_keyboard(
+        draft_id: int, *, processed: bool = False
+    ) -> InlineKeyboardMarkup:
+        buttons = [
             [
-                [
-                    InlineKeyboardButton(
-                        "确认发送", callback_data=f"draft:{draft_id}:confirm"
-                    ),
-                    InlineKeyboardButton(
-                        "取消", callback_data=f"draft:{draft_id}:cancel"
-                    ),
-                ],
-                [
-                    InlineKeyboardButton(
-                        "不处理直接发送", callback_data=f"draft:{draft_id}:direct"
-                    )
-                ],
+                InlineKeyboardButton(
+                    "确认发送", callback_data=f"draft:{draft_id}:confirm"
+                ),
+                InlineKeyboardButton("取消", callback_data=f"draft:{draft_id}:cancel"),
             ]
-        )
+        ]
+        if processed:
+            buttons.append(
+                [InlineKeyboardButton("发送原文", callback_data=f"draft:{draft_id}:direct")]
+            )
+        return InlineKeyboardMarkup(buttons)
 
     @staticmethod
     def _draft_status_keyboard(
         draft_id: int, *, succeeded: int, total: int
     ) -> InlineKeyboardMarkup:
-        label = "✅已发送" if succeeded == total else "⚠️部分发送"
+        label = "✅已发送" if succeeded == total else "⚠️发送未完成"
         return InlineKeyboardMarkup(
             [
                 [
@@ -1038,7 +898,7 @@ class ForwardBotService:
                 chat_id=self.config.bot.owner_id,
                 text=processed.text,
                 reply_to_message_id=original_messages[-1].message_id,
-                reply_markup=self._draft_keyboard(draft_id),
+                reply_markup=self._draft_keyboard(draft_id, processed=True),
             )
             self.pending_drafts[draft_id] = PendingDraft(
                 original_messages=original_messages,
@@ -1050,8 +910,9 @@ class ForwardBotService:
             return
 
         prompt = (
-                "未检测到需要处理的指令，消息尚未发送。请选择确认发送、取消，"
-                "或不处理直接发送；后续新增的处理指令也会在这里提示。"
+            f"相册（{len(original_messages)} 项）待发送。"
+            if len(original_messages) > 1
+            else "消息待发送。"
         )
         await bot.send_message(
             chat_id=self.config.bot.owner_id,
@@ -1093,7 +954,7 @@ class ForwardBotService:
             await query.answer("消息已经处理，不会重复发送。")
             return
 
-        await query.answer("正在处理…")
+        await query.answer()
         draft = self.pending_drafts.pop(draft_id, None)
         if draft is None:
             await query.edit_message_text("这条待发送消息已处理或已失效。")
@@ -1107,10 +968,14 @@ class ForwardBotService:
         else:
             messages = draft.original_messages
         succeeded, total = await self._send_draft_messages(context.bot, messages)
-        query_message = getattr(query, "message", None)
-        original_text = query_message.text if query_message and query_message.text else ""
         status_text = f"已发送 {succeeded}/{total} 个目标。"
-        rendered_text = f"{original_text}\n\n{status_text}" if original_text else status_text
+        # Only preserve the preview when it is the content actually sent.
+        preview_text = (
+            draft.processed_messages[0].text
+            if action == "confirm" and draft.processed_messages
+            else None
+        )
+        rendered_text = f"{preview_text}\n\n{status_text}" if preview_text else status_text
         await query.edit_message_text(
             rendered_text,
             reply_markup=self._draft_status_keyboard(
@@ -1226,75 +1091,7 @@ class ForwardBotService:
             return
         await message.reply_text("Bot 在线。")
 
-    def write_heartbeat(self) -> None:
-        heartbeat = self.config.watchdog.heartbeat_file
-        temporary = heartbeat.with_name(f".{heartbeat.name}.tmp")
-        temporary.write_text(str(time.time()), encoding="ascii")
-        os.replace(temporary, heartbeat)
-
-    async def heartbeat_task(self, context: ContextTypes.DEFAULT_TYPE) -> None:
-        try:
-            self.write_heartbeat()
-            logger.debug("事件循环心跳已更新。")
-        except OSError:
-            logger.exception("写入心跳文件失败。")
-
-    def _mark_polling_healthy(self, age: float) -> None:
-        if self.polling_health_state == "starting":
-            logger.info("Telegram polling 健康检查已建立。")
-        elif self.polling_health_state != "healthy":
-            logger.info("Telegram polling 已恢复，最近完成响应在 %.1f 秒前。", age)
-        self.polling_health_state = "healthy"
-
-    async def polling_health_task(self, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Restart only when polling is stale while a fresh Telegram route still works."""
-        timeout = self.config.network.polling_stale_timeout_s
-        age = self.polling_health.seconds_since_response()
-        if self.polling_health.last_response_at is not None and age <= timeout:
-            self._mark_polling_healthy(age)
-            return
-        if age <= timeout or self.restart_requested:
-            return
-
-        try:
-            await probe_telegram_route(self.config, for_updates=True)
-        except Exception as exc:
-            # The dedicated polling request may recover while the independent probe is running.
-            age = self.polling_health.seconds_since_response()
-            if self.polling_health.last_response_at is not None and age <= timeout:
-                self._mark_polling_healthy(age)
-                return
-            if self.polling_health_state != "network_unavailable":
-                logger.warning(
-                    "Telegram polling 已连续 %.1f 秒未收到 HTTP 响应，独立网络探测也失败；"
-                    "判定为代理或外部网络故障，本次不重启（连续网络异常 %s 次）。原因: %s",
-                    age,
-                    self.polling_health.consecutive_failures,
-                    safe_error_text(exc, self.config),
-                )
-            self.polling_health_state = "network_unavailable"
-            return
-
-        # A newly-created client can reach Telegram. Recheck the original polling route before
-        # requesting a restart, so a concurrent recovery does not cause an unnecessary restart.
-        age = self.polling_health.seconds_since_response()
-        if self.polling_health.last_response_at is not None and age <= timeout:
-            self._mark_polling_healthy(age)
-            return
-
-        self.polling_health_state = "polling_stalled"
-        self.restart_requested = True
-        logger.critical(
-            "Telegram polling 已连续 %.1f 秒未收到 HTTP 响应，但独立网络探测正常；"
-            "判定轮询客户端假死，正在请求看门狗重启（此前连续网络异常 %s 次）。",
-            age,
-            self.polling_health.consecutive_failures,
-        )
-        context.application.stop_running()
-
     async def post_init(self, application: Application) -> None:
-        self.polling_health.reset()
-        self.write_heartbeat()
         identity = application.bot.bot
         username = f"@{identity.username}" if identity.username else str(identity.id)
         logger.info(
@@ -1310,14 +1107,22 @@ class ForwardBotService:
         context: ContextTypes.DEFAULT_TYPE,
     ) -> None:
         error = context.error
-        if isinstance(error, NetworkError):
+        if (
+            update is None
+            and isinstance(error, NetworkError)
+            and not isinstance(error, BadRequest)
+        ):
             now = time.monotonic()
-            if now - self.last_network_error_log_at >= 60:
+            if (
+                self.last_network_error_log_at is None
+                or now - self.last_network_error_log_at >= 60
+            ):
                 logger.warning(
-                    "Telegram polling 网络错误，PTB 将继续重试: %s",
-                    safe_error_text(error, self.config),
+                    "Telegram 连接暂时中断，正在自动重试（%s）。",
+                    type(error).__name__,
                 )
                 self.last_network_error_log_at = now
+            logger.debug("轮询异常详情: %s", safe_error_text(error, self.config))
         else:
             detail = safe_error_text(error, self.config) if error else "未知错误"
             logger.error("处理更新时发生未捕获异常: %s", detail)
@@ -1328,13 +1133,8 @@ def build_application(config: AppConfig, service: ForwardBotService) -> Applicat
         ApplicationBuilder()
         .token(config.bot.token)
         .request(create_request(config, for_updates=False))
-        .get_updates_request(
-            create_request(
-                config,
-                for_updates=True,
-                polling_health=service.polling_health,
-            )
-        )
+        .get_updates_request(create_request(config, for_updates=True))
+        .job_queue(None)
         .post_init(service.post_init)
         .build()
     )
@@ -1353,32 +1153,6 @@ def build_application(config: AppConfig, service: ForwardBotService) -> Applicat
     )
     application.add_error_handler(service.error_handler)
 
-    if application.job_queue is None:
-        raise RuntimeError("JobQueue 不可用，请安装 python-telegram-bot[job-queue]。")
-    application.job_queue.run_repeating(
-        service.heartbeat_task,
-        interval=config.watchdog.heartbeat_interval_s,
-        name="heartbeat",
-        job_kwargs={
-            "coalesce": True,
-            "max_instances": 1,
-            "misfire_grace_time": max(
-                1, math.ceil(config.watchdog.heartbeat_interval_s)
-            ),
-        },
-    )
-    application.job_queue.run_repeating(
-        service.polling_health_task,
-        interval=config.network.polling_health_check_interval_s,
-        name="polling-health",
-        job_kwargs={
-            "coalesce": True,
-            "max_instances": 1,
-            "misfire_grace_time": max(
-                1, math.ceil(config.network.polling_health_check_interval_s)
-            ),
-        },
-    )
     return application
 
 
@@ -1466,9 +1240,6 @@ def main(argv: list[str] | None = None) -> int:
             bootstrap_retries=3,
             close_loop=True,
         )
-        if service.restart_requested:
-            logger.error("机器人因 polling 假死检测主动退出，交由看门狗重启。")
-            return 1
         return 0
     except KeyboardInterrupt:
         logger.info("收到中断信号，正在退出。")

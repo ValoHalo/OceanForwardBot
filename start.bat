@@ -89,9 +89,9 @@ if errorlevel 1 (
 )
 echo Configuration valid.
 
-echo [5/5] Starting watchdog...
+echo [5/5] Starting Bot with automatic crash recovery...
 if not exist "%BOT_SCRIPT%" (
-    echo [ERROR] Watchdog script not found: "%BOT_SCRIPT%"
+    echo [ERROR] Bot supervisor not found: "%BOT_SCRIPT%"
     goto :fail
 )
 
@@ -99,9 +99,9 @@ if not exist "%BOT_SCRIPT%" (
 set "BOT_EXIT_CODE=%ERRORLEVEL%"
 
 if "%BOT_EXIT_CODE%"=="130" (
-    echo Watchdog stopped by user.
+    echo Bot stopped by user.
 ) else if not "%BOT_EXIT_CODE%"=="0" (
-    echo [ERROR] Watchdog exited with code %BOT_EXIT_CODE%.
+    echo [ERROR] Bot exited with code %BOT_EXIT_CODE%.
 )
 
 endlocal & exit /b %BOT_EXIT_CODE%

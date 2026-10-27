@@ -1,5 +1,5 @@
 # Python 3.10+
-# socks: SOCKS5 代理支持；job-queue: 周期性心跳任务。
-python-telegram-bot[socks,job-queue]>=22.0,<23.0
+# socks: SOCKS5 代理支持。
+python-telegram-bot[socks]>=22.0,<23.0
 httpx>=0.27,<0.29
 psutil>=6.0,<8.0

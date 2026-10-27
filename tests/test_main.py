@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, patch
 
 from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
 
@@ -32,12 +32,8 @@ def make_config(
             log_level="INFO",
         ),
         watchdog=main.WatchdogSettings(
-            heartbeat_file=main.BASE_DIR / "test.heartbeat",
-            heartbeat_interval_s=10,
-            heartbeat_timeout_s=30,
             restart_delay_s=0,
             max_consecutive_restarts=2,
-            startup_grace_s=30,
             stable_reset_s=60,
         ),
         network=main.NetworkSettings(
@@ -51,8 +47,6 @@ def make_config(
             max_retries=max_retries,
             retry_base_delay_s=0.01,
             media_group_wait_s=media_group_wait_s,
-            polling_health_check_interval_s=60,
-            polling_stale_timeout_s=300,
         ),
         destinations=(
             main.Destination(
@@ -102,9 +96,6 @@ class ConfigTests(unittest.TestCase):
                 "log_level": "INFO",
             },
             "watchdog": {
-                "heartbeat_file": "test.heartbeat",
-                "heartbeat_interval_s": 10,
-                "heartbeat_timeout_s": 30,
                 "restart_delay_s": 0,
                 "max_consecutive_restarts": 0,
             },
@@ -115,7 +106,6 @@ class ConfigTests(unittest.TestCase):
     def test_load_config_applies_defaults_and_deduplicates_topics(self) -> None:
         config = main.load_config(self.write_config(self.valid_payload()))
         self.assertEqual(config.network.connection_pool_size, 32)
-        self.assertEqual(config.network.polling_stale_timeout_s, 300)
         self.assertEqual(config.watchdog.max_consecutive_restarts, 0)
         self.assertEqual(config.destinations[0].topic_ids, (2, 3))
         self.assertEqual(config.message_processing.url_rewrites, ())
@@ -194,17 +184,21 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(main.ConfigError, "owner_id"):
             main.load_config(self.write_config(payload))
 
-    def test_heartbeat_cannot_escape_project_directory(self) -> None:
+    def test_legacy_monitoring_settings_are_ignored(self) -> None:
         payload = self.valid_payload()
         payload["watchdog"]["heartbeat_file"] = "../outside.heartbeat"
-        with self.assertRaisesRegex(main.ConfigError, "项目目录"):
-            main.load_config(self.write_config(payload))
+        payload["watchdog"]["heartbeat_interval_s"] = 0
+        payload["network"]["polling_stale_timeout_s"] = 0
+        config = main.load_config(self.write_config(payload))
+        self.assertEqual(config.watchdog.max_consecutive_restarts, 0)
 
-    def test_heartbeat_cannot_target_existing_project_file(self) -> None:
+    def test_watchdog_settings_are_optional(self) -> None:
         payload = self.valid_payload()
-        payload["watchdog"]["heartbeat_file"] = "README.md"
-        with self.assertRaisesRegex(main.ConfigError, "heartbeat"):
-            main.load_config(self.write_config(payload))
+        del payload["watchdog"]
+        config = main.load_config(self.write_config(payload))
+        self.assertEqual(config.watchdog.max_consecutive_restarts, 5)
+        self.assertEqual(config.watchdog.restart_delay_s, 5)
+        self.assertEqual(config.watchdog.stable_reset_s, 600)
 
     def test_duplicate_json_key_is_rejected(self) -> None:
         valid = self.valid_payload()
@@ -228,15 +222,6 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(main.ConfigError, "端口"):
             main.load_config(self.write_config(payload))
 
-    def test_polling_health_interval_must_be_shorter_than_stale_timeout(self) -> None:
-        payload = self.valid_payload()
-        payload["network"] = {
-            "polling_health_check_interval_s": 300,
-            "polling_stale_timeout_s": 300,
-        }
-        with self.assertRaisesRegex(main.ConfigError, "polling_health_check_interval_s"):
-            main.load_config(self.write_config(payload))
-
     def test_request_settings_cover_api_and_polling(self) -> None:
         config = make_config()
         api_request = object()
@@ -255,24 +240,6 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(polling_kwargs["proxy"], config.bot.proxy_url)
         self.assertIn("media_write_timeout", api_kwargs)
         self.assertNotIn("media_write_timeout", polling_kwargs)
-
-    def test_polling_request_uses_health_monitor_when_requested(self) -> None:
-        config = make_config()
-        health = main.PollingHealth()
-        monitored_request = object()
-        with patch.object(
-            main, "MonitoredHTTPXRequest", return_value=monitored_request
-        ) as constructor:
-            self.assertIs(
-                main.create_request(
-                    config,
-                    for_updates=True,
-                    polling_health=health,
-                ),
-                monitored_request,
-            )
-        self.assertIs(constructor.call_args.args[0], health)
-        self.assertEqual(constructor.call_args.kwargs["connection_pool_size"], 1)
 
     def test_safe_error_redacts_token_and_proxy_credentials(self) -> None:
         config = make_config()
@@ -461,11 +428,11 @@ class ForwardingTests(unittest.IsolatedAsyncioTestCase):
             for button in row
         ]
         self.assertEqual(
-            button_labels, ["确认发送", "取消", "不处理直接发送"]
+            button_labels, ["确认发送", "取消", "发送原文"]
         )
         self.assertEqual(service.pending_drafts[7].processed_messages, (preview,))
 
-    async def test_stage_draft_without_match_replies_with_instructions(self) -> None:
+    async def test_stage_draft_without_match_waits_for_confirmation(self) -> None:
         service = main.ForwardBotService(
             make_config(url_rewrites=(make_fxtwitter_rule(),))
         )
@@ -478,7 +445,13 @@ class ForwardingTests(unittest.IsolatedAsyncioTestCase):
 
         await service._stage_draft(bot, [original])
 
-        self.assertIn("未检测到需要处理的指令", bot.send_message.await_args.kwargs["text"])
+        call = bot.send_message.await_args.kwargs
+        self.assertEqual(call["text"], "消息待发送。")
+        self.assertEqual(
+            [button.text for row in call["reply_markup"].inline_keyboard for button in row],
+            ["确认发送", "取消"],
+        )
+        original.copy.assert_not_awaited()
         self.assertIsNone(service.pending_drafts[8].processed_messages)
 
     async def test_ping_command_replies_for_owner_private_chat(self) -> None:
@@ -507,18 +480,14 @@ class ForwardingTests(unittest.IsolatedAsyncioTestCase):
 
         message.reply_text.assert_not_awaited()
 
-    async def test_application_wires_monitored_polling_and_health_job(self) -> None:
+    async def test_application_uses_normal_polling_without_jobs(self) -> None:
         asyncio.get_running_loop().slow_callback_duration = 1.0
         service = main.ForwardBotService(make_config())
         application = main.build_application(service.config, service)
         try:
             polling_request = application.bot._request[0]
-            self.assertIsInstance(polling_request, main.MonitoredHTTPXRequest)
-            self.assertIs(polling_request.polling_health, service.polling_health)
-            self.assertEqual(
-                {job.name for job in application.job_queue.jobs()},
-                {"heartbeat", "polling-health"},
-            )
+            self.assertIsInstance(polling_request, main.HTTPXRequest)
+            self.assertIsNone(application.job_queue)
             self.assertEqual(main.ALLOWED_UPDATES, ("message", "callback_query"))
             self.assertTrue(
                 any(
@@ -532,115 +501,27 @@ class ForwardingTests(unittest.IsolatedAsyncioTestCase):
                 *(request.shutdown() for request in application.bot._request)
             )
 
-    async def test_monitored_request_records_transport_result(self) -> None:
-        health = main.PollingHealth()
-        request = object.__new__(main.MonitoredHTTPXRequest)
-        request.polling_health = health
-
-        with patch.object(
-            main.HTTPXRequest,
-            "do_request",
-            new=AsyncMock(return_value=(200, b"{}")),
-        ):
-            await request.do_request("https://example.invalid", "POST")
-        self.assertIsNotNone(health.last_response_at)
-        self.assertEqual(health.consecutive_failures, 0)
-
-        health.last_response_at = None
-        with patch.object(
-            main.HTTPXRequest,
-            "do_request",
-            new=AsyncMock(return_value=(409, b"{}")),
-        ):
-            await request.do_request("https://example.invalid", "POST")
-        self.assertIsNotNone(health.last_response_at)
-        self.assertEqual(health.consecutive_failures, 0)
-
-        with patch.object(
-            main.HTTPXRequest,
-            "do_request",
-            new=AsyncMock(side_effect=NetworkError("offline")),
-        ):
-            with self.assertRaises(NetworkError):
-                await request.do_request("https://example.invalid", "POST")
-        self.assertEqual(health.consecutive_failures, 1)
-
-    async def test_stale_polling_with_failed_probe_does_not_restart(self) -> None:
+    async def test_polling_network_warnings_are_throttled(self) -> None:
         service = main.ForwardBotService(make_config())
-        service.polling_health.monitoring_started_at = main.time.monotonic() - 301
-        stop_running = Mock()
-        context = SimpleNamespace(
-            application=SimpleNamespace(stop_running=stop_running)
-        )
+        context = SimpleNamespace(error=TimedOut("offline"))
+        with patch.object(main.time, "monotonic", side_effect=[0, 1, 60]):
+            with self.assertLogs(main.logger, level="WARNING") as captured:
+                for _ in range(3):
+                    await service.error_handler(None, context)
+        self.assertEqual(len(captured.records), 2)
+        self.assertTrue(all("自动重试" in line for line in captured.output))
 
-        with patch.object(
-            main,
-            "probe_telegram_route",
-            new=AsyncMock(side_effect=NetworkError("proxy offline")),
-        ):
-            with self.assertLogs(main.logger, level="WARNING"):
-                await service.polling_health_task(context)
-
-        self.assertFalse(service.restart_requested)
-        self.assertEqual(service.polling_health_state, "network_unavailable")
-        stop_running.assert_not_called()
-
-    async def test_stale_polling_with_healthy_probe_requests_restart(self) -> None:
+    async def test_message_network_error_is_not_reported_as_polling_retry(self) -> None:
         service = main.ForwardBotService(make_config())
-        service.polling_health.monitoring_started_at = main.time.monotonic() - 301
-        stop_running = Mock()
-        context = SimpleNamespace(
-            application=SimpleNamespace(stop_running=stop_running)
-        )
+        with self.assertLogs(main.logger, level="ERROR") as captured:
+            await service.error_handler(object(), SimpleNamespace(error=TimedOut()))
+        self.assertNotIn("自动重试", captured.output[0])
 
-        with patch.object(
-            main,
-            "probe_telegram_route",
-            new=AsyncMock(return_value=SimpleNamespace(id=1)),
-        ):
-            with self.assertLogs(main.logger, level="CRITICAL"):
-                await service.polling_health_task(context)
-
-        self.assertTrue(service.restart_requested)
-        self.assertEqual(service.polling_health_state, "polling_stalled")
-        stop_running.assert_called_once_with()
-
-    async def test_polling_recovery_during_probe_avoids_restart(self) -> None:
+    async def test_bad_request_is_not_reported_as_polling_retry(self) -> None:
         service = main.ForwardBotService(make_config())
-        service.polling_health.monitoring_started_at = main.time.monotonic() - 301
-        stop_running = Mock()
-        context = SimpleNamespace(
-            application=SimpleNamespace(stop_running=stop_running)
-        )
-
-        async def recover_during_probe(*args, **kwargs):
-            service.polling_health.mark_response()
-            return SimpleNamespace(id=1)
-
-        with patch.object(
-            main,
-            "probe_telegram_route",
-            new=AsyncMock(side_effect=recover_during_probe),
-        ):
-            await service.polling_health_task(context)
-
-        self.assertFalse(service.restart_requested)
-        self.assertEqual(service.polling_health_state, "healthy")
-        stop_running.assert_not_called()
-
-    async def test_heartbeat_write_is_atomic_and_numeric(self) -> None:
-        config = make_config()
-        heartbeat = config.watchdog.heartbeat_file
-        temporary = heartbeat.with_name(f".{heartbeat.name}.tmp")
-        heartbeat.unlink(missing_ok=True)
-        temporary.unlink(missing_ok=True)
-        self.addCleanup(lambda: heartbeat.unlink(missing_ok=True))
-        self.addCleanup(lambda: temporary.unlink(missing_ok=True))
-
-        main.ForwardBotService(config).write_heartbeat()
-
-        self.assertGreater(float(heartbeat.read_text(encoding="ascii")), 0)
-        self.assertFalse(temporary.exists())
+        with self.assertLogs(main.logger, level="ERROR") as captured:
+            await service.error_handler(None, SimpleNamespace(error=BadRequest("bad request")))
+        self.assertNotIn("自动重试", captured.output[0])
 
     async def test_timed_out_request_retries_then_succeeds(self) -> None:
         service = main.ForwardBotService(make_config(max_retries=2))
@@ -717,6 +598,7 @@ class ForwardingTests(unittest.IsolatedAsyncioTestCase):
 
         bot.copy_messages.assert_not_awaited()
         bot.send_message.assert_awaited_once()
+        self.assertEqual(bot.send_message.await_args.kwargs["text"], "相册（2 项）待发送。")
         draft = service.pending_drafts[1]
         self.assertEqual(
             [message.message_id for message in draft.original_messages], [1, 2]
@@ -790,7 +672,7 @@ class ForwardingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(message.copy.await_count, 2)
         query.edit_message_text.assert_awaited_once()
         edit_call = query.edit_message_text.await_args
-        self.assertEqual(edit_call.args[0], "预览消息\n\n已发送 2/2 个目标。")
+        self.assertEqual(edit_call.args[0], "已发送 2/2 个目标。")
         status_buttons = edit_call.kwargs["reply_markup"].inline_keyboard
         self.assertEqual(len(status_buttons), 1)
         self.assertEqual(len(status_buttons[0]), 1)
@@ -819,7 +701,7 @@ class ForwardingTests(unittest.IsolatedAsyncioTestCase):
         keyboard = main.ForwardBotService._draft_status_keyboard(
             7, succeeded=1, total=2
         )
-        self.assertEqual(keyboard.inline_keyboard[0][0].text, "⚠️部分发送")
+        self.assertEqual(keyboard.inline_keyboard[0][0].text, "⚠️发送未完成")
 
     async def test_direct_button_bypasses_processed_preview(self) -> None:
         service = main.ForwardBotService(make_config())
@@ -842,6 +724,32 @@ class ForwardingTests(unittest.IsolatedAsyncioTestCase):
 
         original.copy.assert_awaited_once()
         processed.copy.assert_not_awaited()
+        self.assertEqual(query.edit_message_text.await_args.args[0], "已发送 1/1 个目标。")
+
+    async def test_confirm_sends_processed_preview_and_preserves_its_text(self) -> None:
+        service = main.ForwardBotService(make_config())
+        original = SimpleNamespace(message_id=7, copy=AsyncMock())
+        processed = SimpleNamespace(
+            message_id=8, text="https://fxtwitter.com/a/status/1", copy=AsyncMock()
+        )
+        service.pending_drafts[7] = main.PendingDraft(
+            original_messages=(original,), processed_messages=(processed,)
+        )
+        query = SimpleNamespace(
+            data="draft:7:confirm",
+            from_user=SimpleNamespace(id=service.config.bot.owner_id),
+            answer=AsyncMock(),
+            edit_message_text=AsyncMock(),
+        )
+        await service.handle_draft_action(
+            SimpleNamespace(callback_query=query), SimpleNamespace(bot=SimpleNamespace())
+        )
+        processed.copy.assert_awaited_once()
+        original.copy.assert_not_awaited()
+        self.assertEqual(
+            query.edit_message_text.await_args.args[0],
+            processed.text + "\n\n已发送 1/1 个目标。",
+        )
 
     async def test_cancel_button_never_sends(self) -> None:
         service = main.ForwardBotService(make_config())
